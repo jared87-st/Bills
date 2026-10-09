@@ -230,14 +230,107 @@ const acctOpts=v=>accts().map(a=>`<option value="${esc(a.id)}" ${v===a.id?"selec
 let col=null;const dirty=new Set();const timers={};const chains={};
 function setSync(t){$("#sync").textContent=t}
 function cacheLocal(){try{localStorage.setItem("bp-cache",JSON.stringify(S))}catch(e){}}
-function save(id){dirty.add(id);cacheLocal();clearTimeout(timers[id]);timers[id]=setTimeout(()=>flush(id),600);setSync("Saving…")}
+function markUnsynced(id,on){try{const u=new Set(JSON.parse(localStorage.getItem("bp-unsynced")||"[]"));on?u.add(id):u.delete(id);localStorage.setItem("bp-unsynced",JSON.stringify([...u]))}catch(e){}}
+function save(id){dirty.add(id);markUnsynced(id,true);cacheLocal();clearTimeout(timers[id]);timers[id]=setTimeout(()=>flush(id),600);setSync("Saving…")}
 function saveMonth(mk){save("m-"+mk)}
-function flush(id){dirty.delete(id);if(!dirty.size)setSync("Saved on this phone")}
+function flush(id){dirty.delete(id);if(CL.user){CL.write(id)}else if(!dirty.size)setSync("Saved on this phone")}
+
+/* ---------- cloud sync (Firebase) ---------- */
+const FB_CONFIG={apiKey:"AIzaSyAc0fD1QrJeNcvKOJVev4e_chnSachoeJM",authDomain:"bills-9dc36.firebaseapp.com",projectId:"bills-9dc36",storageBucket:"bills-9dc36.firebasestorage.app",messagingSenderId:"917521577110",appId:"1:917521577110:web:06fc509e94d14c1222beb7"};
+const FB_VER="10.14.1";
+const CL={ready:false,failed:false,user:null,fs:null,auth:null,db:null,unsub:[],pending:0,choice:null,msg:"",busy:false,
+  docRef(id){const f=this.fs;return id==="config"?f.doc(this.db,"users",this.user.uid,"data","config"):f.doc(this.db,"users",this.user.uid,"months",id)},
+  valueOf(id){return id==="config"?S.cfg:S.months[id]},
+  status(){if(!this.user)return;if(this.choice){setSync("Signed in. Choose which data to keep (Setup tab).");return}
+    setSync(!navigator.onLine?"Offline. Changes will sync when you're back online":this.pending||dirty.size?"Syncing…":"Synced across your devices")},
+  async write(id){if(!this.user||this.choice)return;const v=this.valueOf(id);if(v==null)return;this.pending++;this.status();
+    try{await this.fs.setDoc(this.docRef(id),{json:JSON.stringify(v),updated:Date.now()});markUnsynced(id,false)}catch(e){console.error(e);setSync("Couldn't sync: "+(e.code||e.message))}
+    this.pending--;this.status()},
+  async pushAll(){await this.write("config");for(const id of Object.keys(S.months))if(id.startsWith("m-"))await this.write(id)},
+  apply(id,json){
+    let v;try{v=JSON.parse(json)}catch(e){return}
+    if(dirty.has(id))return; // a local edit is about to be sent; it wins
+    if(id==="config"){if(JSON.stringify(S.cfg)===json)return;S.cfg=fixAccounts(Object.assign(BLANK_CFG(),v))}
+    else{if(JSON.stringify(S.months[id])===json)return;S.months[id]=v}
+    cacheLocal();if(isEditing())pendingRender=true;else render()},
+  listen(){const f=this.fs,u=this.user.uid;
+    const on=(col,key)=>f.onSnapshot(f.collection(this.db,"users",u,col),{includeMetadataChanges:false},snap=>{
+      for(const ch of snap.docChanges()){if(ch.type==="removed"||ch.doc.metadata.hasPendingWrites)continue;const d=ch.doc.data();if(d&&typeof d.json==="string")this.apply(key(ch.doc.id),d.json)}
+      this.status()},e=>{console.error(e);setSync("Sync stopped: "+(e.code||e.message))});
+    this.unsub.push(on("data",()=>"config"),on("months",id=>id))},
+  hasLocalWork(){
+    const stable=v=>Array.isArray(v)?"["+v.map(stable).join(",")+"]":v&&typeof v==="object"?"{"+Object.keys(v).sort().map(k=>JSON.stringify(k)+":"+stable(v[k])).join(",")+"}":JSON.stringify(v);
+    const fresh=fixAccounts(Object.assign(BLANK_CFG(),STARTER()));
+    if(stable(S.cfg)!==stable(fresh))return true;
+    return Object.values(S.months).some(o=>o&&(Object.values(o).some(x=>Array.isArray(x)?x.length:x&&typeof x==="object"&&Object.keys(x).length)))},
+  async onUser(user){
+    this.unsub.forEach(f=>{try{f()}catch(e){}});this.unsub=[];this.user=user;this.choice=null;
+    if(!user){if(S.cfg)setSync("Saved on this phone");if(tab==="settings")render();return}
+    setSync("Checking your cloud data…");
+    let linked=null;try{linked=localStorage.getItem("bp-linked")}catch(e){}
+    let remote=null,err=null;try{const snap=await this.fs.getDoc(this.docRef("config"));remote=snap.exists()?snap.data():null}catch(e){err=e;console.error(e)}
+    if(err){
+      if(linked===user.uid){await this.finishLink();return} // already set up here: keep going, catch up when online
+      this.msg="Connect to the internet to finish setting up sync.";setSync("Waiting for internet to finish sync setup");render();
+      addEventListener("online",()=>{if(this.user&&this.user.uid===user.uid){this.msg="";this.onUser(user)}},{once:true});return}
+    if(!remote){await this.pushAll();try{localStorage.setItem("bp-unsynced","[]")}catch(e){}}
+    else if(linked!==user.uid&&this.hasLocalWork()){this.choice=remote;render();this.status();return}
+    await this.finishLink();
+  },
+  async finishLink(){try{localStorage.setItem("bp-linked",this.user.uid)}catch(e){}this.choice=null;
+    let un=[];try{un=JSON.parse(localStorage.getItem("bp-unsynced")||"[]")}catch(e){}
+    for(const id of un)if(this.valueOf(id)!=null)this.write(id); // send edits made while sync was off, before listening
+    this.listen();this.status();render()},
+  async useCloud(){try{localStorage.setItem("bp-unsynced","[]")}catch(e){}S.months={};cacheLocal();await this.finishLink()},
+  async useDevice(){this.choice=null;await this.pushAll();await this.finishLink()},
+  async init(){
+    if(location.protocol.indexOf("http")!==0){this.failed=true;return}
+    try{
+      const base="https://www.gstatic.com/firebasejs/"+FB_VER+"/";
+      const[app,auth,fs]=await Promise.all([import(base+"firebase-app.js"),import(base+"firebase-auth.js"),import(base+"firebase-firestore.js")]);
+      const a=app.initializeApp(FB_CONFIG);
+      this.fs=fs;
+      try{this.db=fs.initializeFirestore(a,{localCache:fs.persistentLocalCache({tabManager:fs.persistentMultipleTabManager()})})}catch(e){this.db=fs.getFirestore(a)}
+      this.authLib=auth;this.auth=auth.getAuth(a);
+      try{await auth.setPersistence(this.auth,auth.indexedDBLocalPersistence)}catch(e){}
+      this.ready=true;if(tab==="settings")render();
+      auth.onAuthStateChanged(this.auth,u=>this.onUser(u));
+      addEventListener("online",()=>this.status());addEventListener("offline",()=>this.status());
+    }catch(e){console.error(e);this.failed=true;if(tab==="settings")render()}
+  },
+  errText(e){const c=(e&&e.code)||"";return{"auth/invalid-credential":"Wrong email or password.","auth/wrong-password":"Wrong email or password.","auth/user-not-found":"No account with that email. Tap Create account.","auth/email-already-in-use":"That email already has an account. Tap Sign in instead.","auth/weak-password":"Password needs at least 6 characters.","auth/invalid-email":"That email doesn't look right.","auth/network-request-failed":"No internet connection.","auth/too-many-requests":"Too many tries. Wait a few minutes and try again.","auth/operation-not-allowed":"Email sign-in isn't turned on in Firebase yet (Authentication › Sign-in method › Email/Password)."}[c]||("Something went wrong: "+(c||e.message))},
+  async signIn(email,pw,create){this.busy=true;this.msg="";render();
+    try{const A=this.authLib;if(create)await A.createUserWithEmailAndPassword(this.auth,email,pw);else await A.signInWithEmailAndPassword(this.auth,email,pw)}
+    catch(e){this.msg=this.errText(e)}this.busy=false;render()},
+  async reset(email){if(!email){this.msg="Type your email first, then tap Forgot password.";render();return}
+    try{await this.authLib.sendPasswordResetEmail(this.auth,email);this.msg="Reset email sent to "+email+". Check your spam folder too."}catch(e){this.msg=this.errText(e)}render()},
+  async signOut(){try{await this.authLib.signOut(this.auth)}catch(e){}try{localStorage.removeItem("bp-linked")}catch(e){}}
+};
+function syncBox(){
+  let h=`<div class="box" id="syncbox"><div class="boxhead"><h3>Sync across devices</h3><span class="small muted">Sign in with the same email on your phone, work phone and iPad</span></div>`;
+  if(CL.failed&&!CL.user)h+=`<div class="note">Sync couldn't load. Check your internet connection and reopen the app. Everything still saves on this device.</div>`;
+  else if(!CL.ready)h+=`<div class="small muted">Loading sync…</div>`;
+  else if(CL.user&&CL.choice){
+    const when=CL.choice.updated?new Date(CL.choice.updated).toLocaleString():"earlier";
+    h+=`<div class="note warn">Your account already has bill data in the cloud (last saved ${esc(when)}), and this device has its own data too. Which one do you want to keep? The other one gets replaced.</div>
+    <div class="form"><button class="btn primary" data-act="syncCloud">Use the cloud data</button><button class="btn" data-act="syncDevice">${armed==="syncDevice"?"Tap again: replace cloud with this device":"Use this device's data"}</button></div>
+    <div class="small muted">Not sure? Choose the device that has your most up-to-date numbers. Save a backup first (below) if you want a safety copy.</div>`;
+  }else if(CL.user){
+    h+=`<div class="form" style="align-items:center"><span>Signed in as <b>${esc(CL.user.email||"")}</b></span><button class="btn" data-act="syncOut">${armed==="syncOut"?"Tap again to sign out":"Sign out"}</button></div>
+    <div class="small muted">Changes you make here show up on your other signed-in devices within a few seconds. Offline changes sync when you reconnect.</div>`;
+  }else{
+    h+=`<form class="form" id="syncForm"><label style="flex:2 1 180px">Email<input id="sy-email" type="email" autocomplete="username" required></label><label style="flex:2 1 140px">Password<input id="sy-pw" type="password" autocomplete="current-password" required minlength="6"></label>
+    <button class="btn primary" type="submit" data-mode="in" ${CL.busy?"disabled":""}>Sign in</button><button class="btn" type="submit" data-mode="new" ${CL.busy?"disabled":""}>Create account</button></form>
+    <div class="form"><button class="btn small" data-act="syncReset">Forgot password</button><span class="small muted">First time? Tap <b>Create account</b> on one device, then <b>Sign in</b> on the others.</span></div>`;
+  }
+  if(CL.msg)h+=`<div class="note">${esc(CL.msg)}</div>`;
+  return h+`</div>`;
+}
 const STARTER=()=>JSON.parse(JSON.stringify({"paycheck": 3200, "earlyDeposit": true, "savingsStart": null, "cushion": 400, "goals": [], "bills": [{"id": "att", "name": "AT&T Internet", "amount": 30.14, "acct": "cashapp", "sched": {"type": "monthly", "day": 1}}, {"id": "storage", "name": "Storage unit", "amount": 65, "acct": "cashapp", "sched": {"type": "monthly", "day": 3}}, {"id": "verizon", "name": "Verizon", "amount": null, "variable": true, "acct": "cashapp", "sched": {"type": "monthly", "day": 5}}, {"id": "car", "name": "Car note", "amount": 729.37, "acct": "main", "auto": true, "sched": {"type": "monthly", "day": 7}}, {"id": "netflix", "name": "Netflix", "amount": 27.61, "acct": "main", "auto": true, "sched": {"type": "monthly", "day": 15}}, {"id": "statefarm", "name": "State Farm", "amount": null, "variable": true, "acct": "main", "auto": true, "sched": {"type": "monthly", "day": 21}}, {"id": "prime", "name": "Amazon Prime (yearly)", "amount": 153, "acct": "main", "auto": true, "sched": {"type": "yearly", "month": 12, "day": 1}}, {"id": "peyton", "name": "Peyton support", "amount": 300, "acct": "main", "auto": false, "sched": {"type": "payday"}}, {"id": "rent", "name": "Rent to savings (½)", "amount": 1175, "acct": "main", "auto": false, "kind": "toSavings", "sched": {"type": "payday", "max": 2}}, {"id": "directv", "name": "DirecTV", "amount": 120, "acct": "savings", "sched": {"type": "monthly", "day": 5}}, {"id": "gas", "name": "Gas", "amount": null, "variable": true, "acct": "savings", "sched": {"type": "monthly", "day": 7}}, {"id": "entergy", "name": "Entergy", "amount": null, "variable": true, "acct": "savings", "sched": {"type": "monthly", "day": 27}}, {"id": "water", "name": "Water & sewage", "amount": null, "variable": true, "acct": "savings", "sched": {"type": "monthly", "day": 28}}], "incomes": [{"id": "dad", "name": "Dad's rent", "amount": 800, "day": 1}], "cards": [{"id": "capone", "name": "Capital One"}, {"id": "chaseamz", "name": "Chase Amazon"}, {"id": "chasesw", "name": "Chase Southwest"}], "debts": [{"id": "mom", "name": "Mom", "start": 1950}, {"id": "joe", "name": "Uncle Joe", "start": 397}]}));
 async function boot(){
   try{const c=JSON.parse(localStorage.getItem("bp-cache")||"null");if(c&&c.cfg){S.cfg=Object.assign(BLANK_CFG(),c.cfg);S.months=c.months||{}}}catch(e){}
   if(!S.cfg)S.cfg=STARTER();fixAccounts(S.cfg);cacheLocal();
-  S.mode="local";setSync("Saved on this phone");
+  S.mode="local";setSync("Saved on this phone");CL.init();
   try{if(navigator.storage&&navigator.storage.persist)navigator.storage.persist()}catch(e){}
   render();
 }
@@ -245,7 +338,7 @@ function backupJSON(){return JSON.stringify({app:"bill-planner",version:1,saved:
 function restoreFrom(text){
   let d;try{d=JSON.parse(text)}catch(e){setSync("That backup couldn't be read. Make sure you pasted the whole thing.");return false}
   if(!d||!d.cfg||!Array.isArray(d.cfg.bills)){setSync("That doesn't look like a Bill Planner backup.");return false}
-  S.cfg=fixAccounts(Object.assign(BLANK_CFG(),d.cfg));S.months=d.months||{};cacheLocal();setSync("Backup restored");render();return true;
+  S.cfg=fixAccounts(Object.assign(BLANK_CFG(),d.cfg));S.months=d.months||{};cacheLocal();setSync("Backup restored");if(CL.user&&!CL.choice)CL.pushAll();render();return true;
 }
 let pendingRender=false;let pendingRestore=null;
 function isEditing(){const a=document.activeElement;return a&&(a.tagName==="INPUT"||a.tagName==="SELECT")&&$("#app").contains(a)}
@@ -620,9 +713,9 @@ function viewCredit(){
 }
 
 function viewSettings(){
-  const c=cfg();
+  const c=cfg();const syncH=syncBox();
   const acctSel=(id,v)=>`<select id="${id}" data-act="bill" data-f="acct" data-id="${id.split("-")[1]}">${acctOpts(v)}</select>`;
-  let h=`<div class="box"><div class="boxhead"><h3>Pay</h3><span class="small muted">Used for every paycheck unless you change one on the Paychecks tab</span></div>
+  let h=syncH+`<div class="box"><div class="boxhead"><h3>Pay</h3><span class="small muted">Used for every paycheck unless you change one on the Paychecks tab</span></div>
   <div class="form"><label>Take-home per check<input class="amt-in" inputmode="decimal" id="set-pay" data-act="cfg" data-f="paycheck" value="${(c.paycheck||0).toFixed(2)}"></label>
   <label style="flex-direction:row;align-items:center;gap:6px;color:var(--ink)"><input type="checkbox" id="set-early" data-act="cfg" data-f="earlyDeposit" ${c.earlyDeposit!==false?"checked":""}> Capital One deposits a day early</label></div>
   ${(()=>{const p=c.paySched||DEFAULT_PAY();const sm=p.newStart.slice(0,7),lm=p.oldLast.slice(0,7);const ms=[...new Set([lm,sm])].sort();
@@ -752,12 +845,17 @@ $("#app").addEventListener("click",e=>{
   else if(a==="restorePaste"){const txt=$("#restoreText").value.trim();if(!txt){setSync("Paste a backup into the box first.");return}
     if(armed!=="restore"){armed="restore";pendingRestore=txt;render();$("#restoreText").value=txt;return}
     armed=null;restoreFrom(pendingRestore||txt);pendingRestore=null}
+  else if(a==="syncCloud")CL.useCloud();
+  else if(a==="syncDevice")arm("syncDevice",()=>CL.useDevice());
+  else if(a==="syncOut")arm("syncOut",()=>CL.signOut());
+  else if(a==="syncReset")CL.reset(($("#sy-email")||{}).value||"");
   else if(a==="addInc"){c.incomes.push({id:uid(),name:"New",amount:0,day:1});save("config");render()}
   else if(a==="addCard"){c.cards.push({id:uid(),name:"New card"});save("config");render()}
   else if(a==="addDebt"){c.debts.push({id:uid(),name:"New",start:0});save("config");render()}
 });
 $("#app").addEventListener("submit",e=>{
   e.preventDefault();const f=e.target;const c=S.cfg;
+  if(f.id==="syncForm"){const mode=(e.submitter&&e.submitter.dataset.mode)||"in";CL.signIn($("#sy-email").value.trim(),$("#sy-pw").value,mode==="new");return}
   if(f.id==="addExtra"){const o=M(viewMk);o.extras.push({id:uid(),name:$("#ex-name").value.trim(),amount:num($("#ex-amt").value),day:parseInt($("#ex-day").value)||1,acct:$("#ex-acct").value});saveMonth(viewMk)}
   else if(f.id==="addSav"){const o=M(viewMk);const v=num($("#sv-amt").value);if(v==null)return;o.sav.push({id:uid(),label:$("#sv-label").value.trim(),amount:v*Number($("#sv-dir").value),day:parseInt($("#sv-day").value)||1});saveMonth(viewMk)}
   else if(f.id==="startBal"){const v=num($("#sb-bal").value);if(v==null)return;c.savingsStart={balance:v,date:$("#sb-date").value||todayStr()};save("config")}

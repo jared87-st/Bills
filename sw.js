@@ -1,5 +1,5 @@
 // Keeps the app working with no internet connection.
-const CACHE = "bill-planner-v3";
+const CACHE = "bill-planner-v4";
 const FILES = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png", "./icon-maskable-512.png"];
 
 self.addEventListener("install", e => {
@@ -14,6 +14,14 @@ self.addEventListener("activate", e => {
 self.addEventListener("fetch", e => {
   if (e.request.method !== "GET") return;
   const url = new URL(e.request.url);
+  // Sync library: keep a saved copy so sign-in and sync still start with no signal.
+  if (url.origin === "https://www.gstatic.com" && url.pathname.startsWith("/firebasejs/")) {
+    e.respondWith(caches.match(e.request).then(hit => hit || fetch(e.request).then(r => {
+      if (r.ok) { const copy = r.clone(); caches.open(CACHE).then(c => c.put(e.request, copy)); }
+      return r;
+    })));
+    return;
+  }
   if (url.origin !== location.origin) return;
   // App files: use the network when it's there so updates arrive, fall back to the saved copy offline.
   // Only good responses are saved, so a login page or error never replaces the app.
